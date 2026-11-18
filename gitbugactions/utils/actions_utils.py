@@ -44,7 +44,7 @@ def get_default_github_actions(
                 RepoStateManager.clean_act_result_dir(repo_clone.workdir)
 
                 actions = GitHubActions(repo_clone.workdir, language)
-                if len(actions.test_workflows) == 1:
+                if len(actions.test_workflows) >= 1:
                     executor = TestExecutor(
                         repo_clone, language, act_cache_dir, actions
                     )

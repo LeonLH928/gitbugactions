@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import subprocess
 import time
 import traceback
 
@@ -8,16 +9,16 @@ import pygit2
 
 
 def delete_repo_clone(repo_clone: pygit2.Repository):
-    def retry_remove(function, path, excinfo):
-        time.sleep(0.5)
-        if os.path.exists(path) and os.path.isdir(path):
-            shutil.rmtree(path)
-        elif os.path.exists(path) and os.path.isfile(path):
-            os.remove(path)
-
+    workdir = getattr(repo_clone, "workdir", None)
     repo_clone.free()
-    if os.path.exists(repo_clone.workdir):
-        shutil.rmtree(repo_clone.workdir, onexc=retry_remove)
+    if workdir and os.path.exists(workdir):
+        try:
+            shutil.rmtree(workdir)
+        except Exception:
+            # Under rootless Podman, container-created files belong to subuids
+            res = subprocess.run(f"podman unshare rm -rf '{workdir}'", shell=True, capture_output=True)
+            if res.returncode != 0 and os.path.exists(workdir):
+                subprocess.run(f"rm -rf '{workdir}'", shell=True)
 
 
 def clone_repo(clone_url: str, path: str) -> pygit2.Repository:

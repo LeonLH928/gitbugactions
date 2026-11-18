@@ -10,6 +10,8 @@ class FileType(Enum):
     SOURCE = 0
     TESTS = 1
     NON_SOURCE = 2
+    DEPENDENCY = 3
+    WORKFLOW = 4
 
 
 def get_file_extension(file_path: str) -> str:
@@ -25,6 +27,34 @@ def get_patch_file_extensions(patch: PatchSet) -> List[str]:
 
 
 def get_file_type(language: str, file_path: str) -> FileType:
+    normalized_path = file_path.replace(os.sep, "/")
+    if (
+        ".github/workflows" in normalized_path
+        or ".github/actions" in normalized_path
+        or normalized_path.endswith(("/action.yml", "/action.yaml", "action.yml", "action.yaml"))
+    ):
+        return FileType.WORKFLOW
+
+    dependency_filenames = {
+        "pom.xml", "build.gradle", "build.gradle.kts", "gradle.properties", "settings.gradle",
+        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+        "requirements.txt", "requirements-dev.txt", "setup.cfg", "pyproject.toml",
+        "pipfile", "pipfile.lock", "poetry.lock", "environment.yml",
+        "go.mod", "go.sum",
+        "cargo.toml", "cargo.lock",
+        "packages.config", "directory.build.props",
+        "cmakelists.txt", "conanfile.txt", "vcpkg.json"
+    }
+    file_name = file_path.split(os.sep)[-1].lower()
+    if (
+        file_name in dependency_filenames
+        or file_name == "setup.py"
+        or "/requirements/" in f"/{normalized_path.lower()}"
+        or (file_name.startswith("requirements") and file_name.endswith((".txt", ".in")))
+        or any(file_name.endswith(ext) for ext in [".csproj", ".fsproj", ".sln"])
+    ):
+        return FileType.DEPENDENCY
+
     language_extensions = {
         "java": {"java"},
         "python": {"py"},
