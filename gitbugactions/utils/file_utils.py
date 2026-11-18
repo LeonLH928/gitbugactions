@@ -36,22 +36,35 @@ def get_file_type(language: str, file_path: str) -> FileType:
         return FileType.WORKFLOW
 
     dependency_filenames = {
+        # Java / JVM
         "pom.xml", "build.gradle", "build.gradle.kts", "gradle.properties", "settings.gradle",
-        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
-        "requirements.txt", "requirements-dev.txt", "setup.cfg", "pyproject.toml",
-        "pipfile", "pipfile.lock", "poetry.lock", "environment.yml",
-        "go.mod", "go.sum",
-        "cargo.toml", "cargo.lock",
-        "packages.config", "directory.build.props",
-        "cmakelists.txt", "conanfile.txt", "vcpkg.json"
+        "settings.gradle.kts", "gradle-wrapper.properties", "libs.versions.toml", "ivy.xml", "build.xml",
+        # JS / TS
+        "package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml",
+        "bun.lockb", "bun.lock", "npm-shrinkwrap.json", ".nvmrc", ".node-version", ".npmrc", ".yarnrc.yml",
+        # Python
+        "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg", "pyproject.toml",
+        "pipfile", "pipfile.lock", "poetry.lock", "uv.lock", "pdm.lock", "environment.yml",
+        "conda.yml", "conda.yaml", "constraints.txt", ".python-version", "tox.ini",
+        # Go
+        "go.mod", "go.sum", "go.work", "go.work.sum",
+        # Rust
+        "cargo.toml", "cargo.lock", "rust-toolchain", "rust-toolchain.toml",
+        # C# / .NET
+        "packages.config", "packages.lock.json", "directory.build.props", "directory.build.targets",
+        "directory.packages.props", "global.json", "nuget.config",
+        # C / C++
+        "cmakelists.txt", "cmakepresets.json", "cmakeuserpresets.json", "conanfile.txt", "conanfile.py",
+        "conan.lock", "vcpkg.json", "vcpkg-configuration.json", "meson.build", "meson_options.txt",
+        "makefile", "gnumakefile", "configure.ac", "build.bazel", "workspace", "workspace.bazel", "module.bazel",
     }
-    file_name = file_path.split(os.sep)[-1].lower()
+    raw_file_name = normalized_path.split("/")[-1]
+    file_name = raw_file_name.lower()
     if (
         file_name in dependency_filenames
-        or file_name == "setup.py"
         or "/requirements/" in f"/{normalized_path.lower()}"
-        or (file_name.startswith("requirements") and file_name.endswith((".txt", ".in")))
-        or any(file_name.endswith(ext) for ext in [".csproj", ".fsproj", ".sln"])
+        or ("requirements" in file_name and file_name.endswith((".txt", ".in")))
+        or file_name.endswith((".csproj", ".fsproj", ".vbproj", ".sln", ".props", ".targets"))
     ):
         return FileType.DEPENDENCY
 
@@ -66,16 +79,25 @@ def get_file_type(language: str, file_path: str) -> FileType:
         "c++": {"cpp", "cc", "cxx", "hpp", "hh", "hxx", "c", "h"},
         "c": {"cpp", "cc", "cxx", "hpp", "hh", "hxx", "c", "h"},
     }
-    test_keywords = {
+    test_dir_keywords = {
         "test",
         "tests",
         "__tests__",
-        "Test",
-        "Tests",
         "unittest",
         "unittests",
+        "unit_tests",
+        "spec",
+        "specs",
+        "__specs__",
+        "__mocks__",
+        "testing",
+        "e2e",
+        "integration_tests",
+        "integration-tests",
+        "functional_tests",
     }
 
+    dir_segments = [seg.lower() for seg in normalized_path.split("/")[:-1] if seg]
     if language in [
         "java",
         "python",
@@ -85,24 +107,47 @@ def get_file_type(language: str, file_path: str) -> FileType:
         "c#",
         "c++",
         "c",
+        "go",
     ]:
-        if any([keyword in file_path.split(os.sep) for keyword in test_keywords]):
-            return FileType.TESTS
-    if language in ["go"]:
-        if "_test.go" in file_path:
-            return FileType.TESTS
-    if language in ["javascript"]:
-        if ".test.js" in file_path:
-            return FileType.TESTS
-    if language in ["typescript"]:
-        if ".test.ts" in file_path:
-            return FileType.TESTS
-    if language in ["c", "c++"] and file_path != "/dev/null":
-        cpp_test_pattern = re.compile(r"(\.test|_test)\.(cpp|c|cc|cxx|hpp|hxx)$")
-        if cpp_test_pattern.search(file_path):
+        if any(
+            seg in test_dir_keywords
+            or seg.endswith((".tests", ".unittests", ".integrationtests"))
+            for seg in dir_segments
+        ):
             return FileType.TESTS
 
-    if get_file_extension(file_path) in language_extensions[language]:
+    if language == "python":
+        if file_name == "conftest.py" or (
+            file_name.endswith(".py")
+            and (file_name.startswith("test_") or file_name.endswith(("_test.py", "_tests.py")))
+        ):
+            return FileType.TESTS
+    elif language == "java":
+        if raw_file_name.endswith(".java") and re.match(
+            r"^(Test.*|.*(Test|Tests|TestCase)|IT.*|.*(IT|ITCase))\.java$",
+            raw_file_name,
+        ):
+            return FileType.TESTS
+    elif language == "go":
+        if file_name.endswith("_test.go"):
+            return FileType.TESTS
+    elif language in ["javascript", "typescript"]:
+        if re.search(r"\.(test|spec)\.(js|jsx|ts|tsx|mjs|cjs)$", file_name):
+            return FileType.TESTS
+    elif language == "rust":
+        if file_name.endswith(("_test.rs", "_tests.rs")):
+            return FileType.TESTS
+    elif language == "c#":
+        if raw_file_name.endswith(("Test.cs", "Tests.cs")):
+            return FileType.TESTS
+    elif language in ["c", "c++"] and file_path != "/dev/null":
+        if re.search(
+            r"(^test_.*|.*(\.test|_test|_tests|Test|Tests))\.(cpp|c|cc|cxx|hpp|hh|hxx|h)$",
+            raw_file_name,
+        ):
+            return FileType.TESTS
+
+    if get_file_extension(file_path) in language_extensions.get(language, set()):
         return FileType.SOURCE
     else:
         return FileType.NON_SOURCE
