@@ -62,7 +62,7 @@ class CollectReposStrategy(RepoStrategy):
     def __init__(
         self,
         data_path: str,
-        use_template_workflows: bool = True,
+        use_template_workflows: bool = False,
         max_repos: Optional[int] = None,
     ):
         self.data_path = data_path
@@ -326,7 +326,7 @@ def collect_repos(
     n_workers: int = 1,
     out_path: str = "./out/",
     base_image: str | None = None,
-    use_template_workflows: bool = True,
+    use_template_workflows: bool = False,
     cleanup_interval: int = 100,
     enable_cleanup: bool = False,
     max_repos: Optional[int] = None,
@@ -342,7 +342,7 @@ def collect_repos(
         n_workers (int, optional): Number of parallel workers. Defaults to 1.
         out_path (str, optional): Folder on which the results will be saved. Defaults to "./out/".
         base_image (str, optional): Base image to use for building the runner image. If None, uses default.
-        use_template_workflows (bool, optional): Whether to use template workflows for repos without test workflows. Defaults to True.
+        use_template_workflows (bool, optional): Whether to use template workflows for repos without test workflows. Defaults to False.
         cleanup_interval (int, optional): Number of jobs after which to run the cleanup function. Defaults to 100.
         enable_cleanup (bool, optional): Whether to enable the periodic cleanup function. Defaults to False.
         max_repos (int, optional): Maximum number of repositories to crawl. Defaults to None.

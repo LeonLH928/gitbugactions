@@ -115,9 +115,7 @@ class TestExecutor:
                 )
                 test_actions.test_workflows.append(new_workflow)
 
-        temp_workflow_path = None
         if len(test_actions.test_workflows) == 0 and len(test_actions.workflows) > 0:
-            # ponytail: existing workflow has broken test command (Type C); run it so it fails instead of masking with template
             for wf in test_actions.workflows:
                 wf.instrument_os()
                 wf.instrument_on_events()
@@ -127,20 +125,6 @@ class TestExecutor:
                     + "-gitbugactions-crawler.yml",
                 )
                 test_actions.test_workflows.append(wf)
-        elif len(test_actions.test_workflows) == 0:
-            temp_workflow_path = TemplateWorkflowManager.create_temp_workflow(
-                self.repo_clone.workdir, self.language
-            )
-            # Re-create the actions instance to include the template workflow
-            test_actions = GitHubActions(
-                self.repo_clone.workdir,
-                self.language,
-                keep_containers=keep_containers,
-                runner_image=self.runner_image,
-                offline=offline,
-                base_image=self.base_image,
-                instrument_workflows=self.instrument_workflows,
-            )
 
         act_runs: List[ActTestsRun] = []
 
@@ -158,9 +142,6 @@ class TestExecutor:
         # Only delete the ones we have created
         if self.instrument_workflows:
             test_actions.delete_workflows()
-
-            if temp_workflow_path:
-                TemplateWorkflowManager.remove_temp_workflow(temp_workflow_path)
 
         for act_run in act_runs:
             act_run.default_actions = default_actions
