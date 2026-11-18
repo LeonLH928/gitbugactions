@@ -27,6 +27,17 @@ from gitbugactions.utils.file_utils import get_file_type, FileType
         ("java", "assets/image.png", FileType.NON_SOURCE),
         ("c++", "build/output.o", FileType.NON_SOURCE),
         ("c++", "/dev/null", FileType.NON_SOURCE),
+        # Test for dependency files
+        ("python", "requirements.txt", FileType.DEPENDENCY),
+        ("python", "pyproject.toml", FileType.DEPENDENCY),
+        ("java", "pom.xml", FileType.DEPENDENCY),
+        ("javascript", "package.json", FileType.DEPENDENCY),
+        ("rust", "Cargo.toml", FileType.DEPENDENCY),
+        ("go", "go.mod", FileType.DEPENDENCY),
+        # Test for workflow files
+        ("python", ".github/workflows/ci.yml", FileType.WORKFLOW),
+        ("java", ".github/workflows/build.yaml", FileType.WORKFLOW),
+        ("javascript", "action.yml", FileType.WORKFLOW),
     ],
 )
 def test_get_file_type(language, file_path, expected):
