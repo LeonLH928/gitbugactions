@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -50,7 +51,10 @@ class PatchCollector:
 
     def __init__(self, repo: Repository, **kwargs):
         self.repo: Repository = repo
-        self.language = repo.language.strip().lower()
+        lang = repo.language
+        if lang is None and isinstance(getattr(repo, "get_languages", lambda: None)(), dict):
+            lang = next(iter(repo.get_languages()), "unknown")
+        self.language = (lang or "unknown").strip().lower()
         self.cloned = False
         self.clone_lock = threading.Lock()
         self.default_github_actions = None
@@ -61,6 +65,9 @@ class PatchCollector:
         self.filter_on_commit_time_end = kwargs.get("filter_on_commit_time_end", None)
         self.pull_requests = kwargs.get("pull_requests", False)
         self.filter_linked_to_pr = kwargs.get("filter_linked_to_pr", None)
+        self.max_commits = kwargs.get("max_commits", None)
+        self.cap_normal_pass = kwargs.get("cap_normal_pass", True)
+        self.normal_pass_count = 0
 
     def __clone_repo(self):
         # Too many repos cloning at the same time lead to errors
@@ -101,24 +108,47 @@ class PatchCollector:
         patch: PatchSet = PatchSet(diff.patch)
         bug_patch: PatchSet = PatchSet("")
         test_patch: PatchSet = PatchSet("")
+        dependency_patch: PatchSet = PatchSet("")
+        workflow_patch: PatchSet = PatchSet("")
         non_code_patch: PatchSet = PatchSet("")
 
-        # FIXME change keywords according to build tool
         for p in patch:
-            if (
-                get_file_type(self.language, p.source_file) == FileType.TESTS
-                or get_file_type(self.language, p.target_file) == FileType.TESTS
-            ):
+            source_type = get_file_type(self.language, p.source_file)
+            target_type = get_file_type(self.language, p.target_file)
+            if source_type == FileType.TESTS or target_type == FileType.TESTS:
                 test_patch.append(p)
-            elif (
-                get_file_type(self.language, p.source_file) == FileType.SOURCE
-                or get_file_type(self.language, p.target_file) == FileType.SOURCE
-            ):
+            elif source_type == FileType.SOURCE or target_type == FileType.SOURCE:
                 bug_patch.append(p)
+            elif (
+                source_type == FileType.DEPENDENCY
+                or target_type == FileType.DEPENDENCY
+            ):
+                dependency_patch.append(p)
+            elif (
+                source_type == FileType.WORKFLOW
+                or target_type == FileType.WORKFLOW
+            ):
+                workflow_patch.append(p)
             else:
                 non_code_patch.append(p)
 
-        return bug_patch, test_patch, non_code_patch
+        return (
+            bug_patch,
+            test_patch,
+            non_code_patch,
+            dependency_patch,
+            workflow_patch,
+        )
+
+    @staticmethod
+    def _get_incoming_diff(repo_clone, previous_commit) -> Tuple[Optional[str], str]:
+        """Return (previous_parent_hash, raw diff prev~1 -> prev) for Stage 1 leak-free input."""
+        try:
+            prev_parent = repo_clone.revparse_single(str(previous_commit.id) + "~1")
+        except KeyError:
+            return None, ""
+        diff = repo_clone.diff(str(prev_parent.id), str(previous_commit.id))
+        return str(prev_parent.id), (diff.patch or "")
 
     def __test_patch(
         self,
@@ -143,24 +173,31 @@ class PatchCollector:
             def all_runs_crashed(x):
                 return x is None or all(map(lambda act_run: act_run.failed, x))
 
+            active_strategy_names = [s.name for s in TestConfig.strategies]
+            allows_prev_crash = (
+                ("DEPENDENCY_CONFLICT" in active_strategy_names and len(bug.dependency_patch) > 0)
+                or ("PIPELINE_CONFIG" in active_strategy_names and len(bug.workflow_patch) > 0)
+                or any(name in active_strategy_names for name in ("FAIL_PASS_BUILD", "FAIL_FAIL"))
+            )
+
             # Previous commit
             act_runs = bug.test_previous_commit(executor)
-            if all_runs_crashed(act_runs):
+            if act_runs is None or (
+                all_runs_crashed(act_runs) and not allows_prev_crash
+            ):
                 return test_patch_runs
             test_patch_runs[0] = act_runs
 
             # Previous commit with diff
             if len(bug.test_patch) > 0:
                 act_runs = bug.test_previous_commit_with_diff(executor)
-                if all_runs_crashed(act_runs):
-                    return test_patch_runs
-                test_patch_runs[1] = act_runs
+                if act_runs is not None:
+                    test_patch_runs[1] = act_runs
 
             # Current commit
             act_runs = bug.test_current_commit(executor)
-            if all_runs_crashed(act_runs):
-                return test_patch_runs
-            test_patch_runs[2] = act_runs
+            if act_runs is not None:
+                test_patch_runs[2] = act_runs
         finally:
             delete_repo_clone(repo_clone)
 
@@ -278,6 +315,9 @@ class PatchCollector:
 
         commit_to_patches: Dict[str, List[BugPatch]] = {}
         commits = list(self.repo_clone.walk(self.repo_clone.head.target))
+        if self.max_commits:
+            # walk() is newest-first: cap per-repo cost, keep most recent history
+            commits = commits[: self.max_commits]
 
         try:
             if self.pull_requests:
@@ -288,8 +328,10 @@ class PatchCollector:
                         commits.append(self.repo_clone.get(pull_commit.sha))
 
             for commit in commits:
-                if self.filter_on_commit_message and not self.__is_bug_fix(commit):
-                    continue
+                # Deferred: dependency/workflow commits (Type B/C) bypass the message filter
+                msg_rejected = (
+                    self.filter_on_commit_message and not self.__is_bug_fix(commit)
+                )
 
                 commit_time = datetime.datetime.fromtimestamp(
                     int(commit.commit_time), datetime.UTC
@@ -321,12 +363,23 @@ class PatchCollector:
                     # The current commit is the first one
                     continue
 
-                bug_patch, test_patch, non_code_patch = self.__get_patches(
-                    self.repo_clone, commit, previous_commit
-                )
-                if len(bug_patch) == 0 and len(non_code_patch) == 0:
+                (
+                    bug_patch,
+                    test_patch,
+                    non_code_patch,
+                    dependency_patch,
+                    workflow_patch,
+                ) = self.__get_patches(self.repo_clone, commit, previous_commit)
+                if msg_rejected and len(dependency_patch) == 0 and len(workflow_patch) == 0:
+                    continue
+                if (
+                    len(bug_patch) == 0
+                    and len(non_code_patch) == 0
+                    and len(dependency_patch) == 0
+                    and len(workflow_patch) == 0
+                ):
                     logging.info(
-                        f"Skipping commit {self.repo.full_name} {str(commit.id)}: no bug patch"
+                        f"Skipping commit {self.repo.full_name} {str(commit.id)}: no bug, dependency, or workflow patch"
                     )
                     continue
 
@@ -335,30 +388,27 @@ class PatchCollector:
                 actions.update(self.__get_used_actions(str(previous_commit.id)))
                 actions.update(self.__get_template_actions())
 
+                prev_parent_hash, incoming_diff = self._get_incoming_diff(
+                    self.repo_clone, previous_commit
+                )
+                bp = BugPatch(
+                    self.repo,
+                    commit,
+                    previous_commit,
+                    bug_patch,
+                    test_patch,
+                    non_code_patch,
+                    actions,
+                    dependency_patch=dependency_patch,
+                    workflow_patch=workflow_patch,
+                    previous_parent_hash=prev_parent_hash,
+                    incoming_diff=incoming_diff,
+                )
+
                 if str(previous_commit.id) in commit_to_patches:
-                    commit_to_patches[str(previous_commit.id)].append(
-                        BugPatch(
-                            self.repo,
-                            commit,
-                            previous_commit,
-                            bug_patch,
-                            test_patch,
-                            non_code_patch,
-                            actions,
-                        )
-                    )
+                    commit_to_patches[str(previous_commit.id)].append(bp)
                 else:
-                    commit_to_patches[str(previous_commit.id)] = [
-                        BugPatch(
-                            self.repo,
-                            commit,
-                            previous_commit,
-                            bug_patch,
-                            test_patch,
-                            non_code_patch,
-                            actions,
-                        )
-                    ]
+                    commit_to_patches[str(previous_commit.id)] = [bp]
                 RepoStateManager.reset_to_commit(self.repo_clone, commit.id)
         finally:
             RepoStateManager.reset_to_commit(self.repo_clone, self.first_commit.id)
@@ -393,20 +443,46 @@ class PatchCollector:
         )
 
     def test_patch(self, bug_patch: BugPatch):
+        # Optionally cap NORMAL_PASS at 2 per repo and skip pure non-code commits once 1 PASS is collected
+        if (
+            self.cap_normal_pass
+            and self.normal_pass_count >= 1
+            and bug_patch.change_type.name == "NON_CODE_ONLY"
+        ):
+            return False
         act_cache_dir = ActCacheDirManager.acquire_act_cache_dir()
 
         try:
+            logging.info(
+                f"   ↳ [Act Test] Đang test patch {bug_patch.commit[:8]} "
+                f"trên {bug_patch.repo.full_name} (chờ Act runner)..."
+            )
+            t_test_start = time.time()
             test_patch_runs = self.__test_patch(
                 bug_patch,
                 act_cache_dir,
             )
             bug_patch.actions_runs = test_patch_runs
             strategy = PatchCollector.check_runs(bug_patch)
+            if strategy == "NORMAL_PASS":
+                if self.cap_normal_pass and self.normal_pass_count >= 2:
+                    strategy = None
+                else:
+                    self.normal_pass_count += 1
+            t_test_dur = time.time() - t_test_start
             if strategy is None:
+                logging.info(
+                    f"   ↳ [Act Test] Commit {bug_patch.commit[:8]} không thỏa mãn taxonomy strategy nào "
+                    f"({t_test_dur:.1f}s)"
+                )
                 return False
             else:
                 bug_patch.strategy_used = strategy
                 bug_patch.issues = self.__get_related_commit_info(bug_patch.commit)
+                logging.info(
+                    f"   ↳ [Act Test] Commit {bug_patch.commit[:8]} KHỚP strategy '{strategy}'! "
+                    f"({t_test_dur:.1f}s)"
+                )
                 return True
         finally:
             ActCacheDirManager.return_act_cache_dir(act_cache_dir)
@@ -453,12 +529,21 @@ class PatchCollector:
                     previous_commit = commit.parents[0]
 
                     # Get patches and actions
-                    bug_patch, test_patch, non_code_patch = self.__get_patches(
-                        self.repo_clone, commit, previous_commit
-                    )
+                    (
+                        bug_patch,
+                        test_patch,
+                        non_code_patch,
+                        dependency_patch,
+                        workflow_patch,
+                    ) = self.__get_patches(self.repo_clone, commit, previous_commit)
 
-                    # Skip if there's no bug patch or non-code patch
-                    if len(bug_patch) == 0 and len(non_code_patch) == 0:
+                    # Skip if there's no bug, dependency, or workflow patch
+                    if (
+                        len(bug_patch) == 0
+                        and len(non_code_patch) == 0
+                        and len(dependency_patch) == 0
+                        and len(workflow_patch) == 0
+                    ):
                         logging.info(
                             f"Skipping commit {self.repo.full_name} {str(commit.id)}: no bug patch"
                         )
@@ -470,6 +555,9 @@ class PatchCollector:
                     actions.update(self.__get_used_actions(str(previous_commit.id)))
                     actions.update(self.__get_template_actions())
 
+                    prev_parent_hash, incoming_diff = self._get_incoming_diff(
+                        self.repo_clone, previous_commit
+                    )
                     # Create a BugPatch object
                     patch = BugPatch(
                         self.repo,
@@ -479,6 +567,10 @@ class PatchCollector:
                         test_patch,
                         non_code_patch,
                         actions,
+                        dependency_patch=dependency_patch,
+                        workflow_patch=workflow_patch,
+                        previous_parent_hash=prev_parent_hash,
+                        incoming_diff=incoming_diff,
                     )
 
                     bug_patches.append(patch)
@@ -496,20 +588,23 @@ class PatchCollector:
 
 def set_test_config(
     normalize_non_code_patch: bool = True,
-    strategies: Tuple[str] = ("PASS_PASS", "FAIL_PASS"),
+    strategies: Tuple[str] = (
+        # Structural strategies first: first match wins in check_runs()
+        "PIPELINE_CONFIG",
+        "DEPENDENCY_CONFLICT",
+        "PASS_PASS",
+        "FAIL_PASS",
+        "PRE_EXISTING",
+    ),
 ):
     TestConfig.normalize_non_code_patch = normalize_non_code_patch
     strategy_instances = [s() for s in CollectionStrategy.__subclasses__()]
 
+    TestConfig.strategies = []
     for strategy in strategies:
-        TestConfig.strategies.append(
-            next(
-                filter(
-                    lambda x: x.name == strategy,
-                    strategy_instances,
-                )
-            )
-        )
+        matched = [s for s in strategy_instances if s.name == strategy]
+        if matched:
+            TestConfig.strategies.append(matched[0])
 
 
 def parse_commit_url(commit_url: str) -> Tuple[str, str]:
@@ -538,12 +633,21 @@ def collect_bugs(
     filter_on_commit_time_start: str = None,
     filter_on_commit_time_end: str = None,
     normalize_non_code_patch: bool = True,
-    strategies: Tuple[str] = ("PASS_PASS", "FAIL_PASS"),
+    strategies: Tuple[str] = (
+        "PIPELINE_CONFIG",
+        "DEPENDENCY_CONFLICT",
+        "PASS_PASS",
+        "FAIL_PASS",
+        "PRE_EXISTING",
+    ),
     pull_requests: bool = False,
     filter_linked_to_pr: bool = None,
     base_image: str | None = None,
     use_default_actions: bool = False,
     commit_list_file: str = None,
+    collect_passing_commits: bool = False,
+    max_commits: int = None,
+    cap_normal_pass: bool = True,
 ):
     """Collects bug-fixes from the repos listed in `data_path`. The result is saved
     on `results_path`. A file `data.json` is also created with information about
@@ -560,15 +664,36 @@ def collect_bugs(
         filter_on_commit_time_start (str, optional): If set, only commits after this date will be considered. The string must follow the format "yyyy-mm-dd HH:MM UTC".
         filter_on_commit_time_end (str, optional): If set, only commits before this date will be considered. The string must follow the format "yyyy-mm-dd HH:MM UTC".
         normalize_non_code_patch (bool, optional): If True, the non-code patch will be applied to previous commits. Defaults to True.
-        strategies (Tuple[str], optional): List of strategies to be used. Defaults to ("PASS_PASS", "FAIL_PASS").
-                                           The available strategies are: "PASS_PASS", "FAIL_PASS", "FAIL_FAIL", "FAIL_PASS_BUILD".
+        strategies (Tuple[str], optional): List of strategies to be used.
+                                           The available strategies are: "PASS_PASS", "FAIL_PASS", "FAIL_FAIL", "FAIL_PASS_BUILD", "DEPENDENCY_CONFLICT", "PIPELINE_CONFIG", "PRE_EXISTING", "NORMAL_PASS".
         pull_requests (bool, optional): If True, the commits in pull requests will be considered. Defaults to False.
         filter_linked_to_pr (bool, optional): If True, only include commits that are linked to pull requests. If False, only include commits that are not linked to pull requests. If None, include all commits. Defaults to None.
         base_image (str, optional): Base image to use for building the runner image. If None, uses default.
         use_default_actions (bool, optional): Whether to use and collect default GitHub actions from repositories. Defaults to False.
         commit_list_file (str, optional): Path to a JSON file containing a list of commit URLs to analyze. If provided, data_path is ignored. Defaults to None.
+        collect_passing_commits (bool, optional): If True, also collects passing commits (NORMAL_PASS) for Stage 1 training. Defaults to False.
     """
-    set_test_config(normalize_non_code_patch, strategies)
+    strategies = list(strategies)
+    if collect_passing_commits:
+        if "NORMAL_PASS" not in strategies:
+            strategies.append("NORMAL_PASS")
+        filter_on_commit_message = False
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
+    logging.info("=" * 60)
+    logging.info("🚀 Bước 2: Bắt đầu thu thập commits & phân loại Taxonomy")
+    logging.info(f"🚀 Nguồn dữ liệu: {data_path} | Kết quả lưu tại: {results_path}")
+    logging.info(f"🚀 Strategies: {strategies} | Workers: {n_workers} | Memory: {memory_limit}")
+    logging.info("=" * 60)
+    t_step2_start = time.time()
+
+    set_test_config(normalize_non_code_patch, tuple(strategies))
 
     Act.set_memory_limit(memory_limit)
     Act(base_image=base_image)  # Initialize Act with base_image
@@ -592,6 +717,8 @@ def collect_bugs(
         ),
         "pull_requests": pull_requests,
         "filter_linked_to_pr": filter_linked_to_pr,
+        "max_commits": max_commits,
+        "cap_normal_pass": cap_normal_pass,
     }
 
     patch_collectors: List[Tuple[PatchCollector, Any]] = []
@@ -657,35 +784,56 @@ def collect_bugs(
         with ThreadPoolExecutor(max_workers=n_workers) as executor:
             future_to_collector: Dict[Future, PatchCollector] = {}
 
-            dir_list = os.listdir(data_path)
-            for file in dir_list:
-                if file.endswith(".json"):
-                    with open(os.path.join(data_path, file), "r") as f:
-                        run = json.loads(f.read())
+            if not os.path.exists(data_path):
+                logging.error(f"Data path '{data_path}' does not exist.")
+                return
 
-                        if (
-                            (
-                                run["number_of_test_actions"] == 1
-                                or run["using_template_workflow"]
-                            )
-                            and "actions_run" in run
-                            and len(run["actions_run"]["tests"]) > 0
-                        ):
-                            repo = github.get_repo(run["repository"])
-                            patch_collector = PatchCollector(repo, **kwargs)
-                            future_to_collector[
-                                executor.submit(patch_collector.get_possible_patches)
-                            ] = patch_collector
+            if os.path.isfile(data_path):
+                files_to_read = [data_path]
+            else:
+                files_to_read = [
+                    os.path.join(data_path, file)
+                    for file in os.listdir(data_path)
+                    if file.endswith(".json")
+                ]
 
+            logging.info(f"📂 Đã đọc danh sách từ '{data_path}': tìm thấy {len(files_to_read)} files repo metadata")
+
+            for file_path in files_to_read:
+                with open(file_path, "r") as f:
+                    run = json.loads(f.read())
+
+                    if (
+                        (
+                            run.get("number_of_test_actions", 0) >= 1
+                            or run.get("using_template_workflow", False)
+                        )
+                        and "actions_run" in run
+                        and len(run["actions_run"].get("tests", [])) > 0
+                    ):
+                        repo = github.get_repo(run["repository"])
+                        patch_collector = PatchCollector(repo, **kwargs)
+                        future_to_collector[
+                            executor.submit(patch_collector.get_possible_patches)
+                        ] = patch_collector
+
+            total_collectors = len(future_to_collector)
+            logging.info(f"⏳ Bắt đầu đào lịch sử Git cho {total_collectors} repos hợp lệ để tìm candidate bug patches...")
+            collector_idx = 0
             for future in tqdm.tqdm(
-                as_completed(future_to_collector), total=len(future_to_collector)
+                as_completed(future_to_collector), total=total_collectors, desc="Mining commits"
             ):
+                collector_idx += 1
                 try:
                     patch_collector = future_to_collector[future]
                     result = future.result()
+                    logging.info(
+                        f"   ↳ [{collector_idx}/{total_collectors}] {patch_collector.repo.full_name}: "
+                        f"phát hiện {len(result)} candidate bug patches"
+                    )
                 except Exception:
                     logging.error(
-                        f"Error while collecting commits from {patch_collector.repo}: {traceback.format_exc()}"
+                        f"   ↳ [{collector_idx}/{total_collectors}] Lỗi thu thập commits: {traceback.format_exc()}"
                     )
                 else:
                     patch_collectors.append((patch_collector, result))
@@ -711,16 +859,23 @@ def collect_bugs(
             for bug_patch in bug_patches:
                 actions_to_download.update(bug_patch.actions)
 
+        total_actions = len(actions_to_download)
+        logging.info(f"📦 Đang tải và cache {total_actions} GitHub Action dependencies...")
+
         for action in actions_to_download:
             futures_to_actions[
                 executor.submit(ActCacheDirManager.cache_action, action)
             ] = action
 
+        action_idx = 0
         for future in tqdm.tqdm(
-            as_completed(futures_to_actions), total=len(futures_to_actions)
+            as_completed(futures_to_actions), total=len(futures_to_actions), desc="Caching actions"
         ):
+            action_idx += 1
             try:
                 future.result()
+                if action_idx % 5 == 0 or action_idx == total_actions:
+                    logging.info(f"   ↳ Đã cache [{action_idx}/{total_actions}] actions...")
             except Exception:
                 logging.error(
                     f"Error while downloading action: {traceback.format_exc()}"
@@ -737,7 +892,7 @@ def collect_bugs(
                 ] = patch_collector
 
             for future in tqdm.tqdm(
-                as_completed(future_to_collector), total=len(future_to_collector)
+                as_completed(future_to_collector), total=len(future_to_collector), desc="Setting default actions"
             ):
                 try:
                     patch_collector = future_to_collector[future]
@@ -760,18 +915,28 @@ def collect_bugs(
                     executor.submit(patch_collector.test_patch, bug_patch)
                 ] = bug_patch
 
+        total_patches = len(future_to_patches)
+        logging.info(f"🧪 Bắt đầu kiểm thử {total_patches} candidate patches bằng Act (workers={n_workers})...")
+        patch_idx = 0
+        accepted_count = 0
+        strategy_stats = {}
+
         for future in tqdm.tqdm(
-            as_completed(future_to_patches), total=len(future_to_patches)
+            as_completed(future_to_patches), total=total_patches, desc="Testing patches"
         ):
+            patch_idx += 1
             try:
                 bug_patch = future_to_patches[future]
                 is_patch = future.result()
             except Exception:
                 logging.error(
-                    f"Error while collecting patches from {bug_patch.repo}: {traceback.format_exc()}"
+                    f"   ↳ [{patch_idx}/{total_patches}] ❌ Lỗi kiểm thử patch: {traceback.format_exc()}"
                 )
             else:
                 if is_patch:
+                    accepted_count += 1
+                    strat = getattr(bug_patch, "strategy_used", "UNKNOWN")
+                    strategy_stats[strat] = strategy_stats.get(strat, 0) + 1
                     data_path = os.path.join(
                         results_path,
                         bug_patch.repo.full_name.replace("/", "-") + ".json",
@@ -779,9 +944,28 @@ def collect_bugs(
                     with open(data_path, "a") as fp:
                         data = bug_patch.get_data()
                         fp.write((json.dumps(data) + "\n"))
+                    logging.info(
+                        f"   ↳ [{patch_idx}/{total_patches}] ✅ ACCEPTED: {bug_patch.repo.full_name}@{bug_patch.commit[:8]} "
+                        f"(Strategy: {strat}) | Tổng accepted: {accepted_count}"
+                    )
+                else:
+                    logging.info(
+                        f"   ↳ [{patch_idx}/{total_patches}] ❌ REJECTED: {bug_patch.repo.full_name}@{bug_patch.commit[:8]}"
+                    )
 
     for patch_collector, _ in patch_collectors:
         patch_collector.delete_repo()
+
+    t_step2_dur = time.time() - t_step2_start
+    logging.info("=" * 60)
+    logging.info(f"🎉 Bước 2 hoàn thành sau {t_step2_dur:.1f}s!")
+    logging.info(f"🎉 Đã kiểm thử: {total_patches} candidate patches | Chấp nhận (Accepted): {accepted_count}")
+    if strategy_stats:
+        logging.info("🎉 Phân bố chiến lược đã thu thập:")
+        for s_name, s_count in strategy_stats.items():
+            logging.info(f"   ↳ {s_name}: {s_count}")
+    logging.info(f"🎉 Kết quả lưu tại: {results_path}")
+    logging.info("=" * 60)
 
 
 def main():

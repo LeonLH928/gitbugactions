@@ -19,13 +19,31 @@ class ChangeType(Enum):
     SOURCE_ONLY = 0
     MIXED = 1
     NON_CODE_ONLY = 2
+    DEPENDENCY_ONLY = 3
+    WORKFLOW_ONLY = 4
 
     @staticmethod
-    def get_change_type(bug_patch: PatchSet, non_code_patch: PatchSet) -> "ChangeType":
-        if len(bug_patch) > 0 and len(non_code_patch) > 0:
+    def get_change_type(
+        bug_patch: PatchSet,
+        non_code_patch: PatchSet,
+        dependency_patch: Optional[PatchSet] = None,
+        workflow_patch: Optional[PatchSet] = None,
+    ) -> "ChangeType":
+        has_source = len(bug_patch) > 0
+        has_dep = dependency_patch is not None and len(dependency_patch) > 0
+        has_workflow = workflow_patch is not None and len(workflow_patch) > 0
+        has_non_code = len(non_code_patch) > 0
+
+        if has_source and (has_dep or has_workflow or has_non_code):
             return ChangeType.MIXED
-        elif len(bug_patch) > 0:
+        elif has_source:
             return ChangeType.SOURCE_ONLY
+        elif has_dep and not has_workflow and not has_non_code:
+            return ChangeType.DEPENDENCY_ONLY
+        elif has_workflow and not has_dep and not has_non_code:
+            return ChangeType.WORKFLOW_ONLY
+        elif has_dep or has_workflow:
+            return ChangeType.MIXED
         else:
             return ChangeType.NON_CODE_ONLY
 
@@ -40,9 +58,16 @@ class BugPatch:
         test_patch: PatchSet,
         non_code_patch: PatchSet,
         actions: Set[Action],
+        dependency_patch: Optional[PatchSet] = None,
+        workflow_patch: Optional[PatchSet] = None,
+        previous_parent_hash: Optional[str] = None,
+        incoming_diff: str = "",
     ):
         self.repo: Repository = repo
-        self.language: str = repo.language.lower().strip()
+        lang = repo.language
+        if lang is None and isinstance(getattr(repo, "get_languages", lambda: None)(), dict):
+            lang = next(iter(repo.get_languages()), "unknown")
+        self.language: str = (lang or "unknown").lower().strip()
         self.commit: str = str(commit.id)
         self.commit_message: str = commit.message
         self.commit_timestamp: str = (
@@ -73,21 +98,42 @@ class BugPatch:
         self.test_patch_file_extensions: List[str] = get_patch_file_extensions(
             self.test_patch
         )
+        self.dependency_patch: PatchSet = self.__clean_patch(
+            dependency_patch or PatchSet("")
+        )
+        self.dependency_patch_file_extensions: List[str] = get_patch_file_extensions(
+            self.dependency_patch
+        )
+        self.workflow_patch: PatchSet = self.__clean_patch(
+            workflow_patch or PatchSet("")
+        )
+        self.workflow_patch_file_extensions: List[str] = get_patch_file_extensions(
+            self.workflow_patch
+        )
         self.non_code_patch: PatchSet = self.__clean_patch(non_code_patch)
         self.non_code_patch_file_extensions: List[str] = get_patch_file_extensions(
             self.non_code_patch
         )
         self.change_type: ChangeType = ChangeType.get_change_type(
-            self.bug_patch, self.non_code_patch
+            self.bug_patch,
+            self.non_code_patch,
+            self.dependency_patch,
+            self.workflow_patch,
         )
         self.actions: Set[Action] = actions
+        self.previous_parent_hash: Optional[str] = previous_parent_hash
+        self.incoming_diff: str = incoming_diff
         self.strategy_used: str = "UNKNOWN"
         self.issues = None
         # The actions are grouped by each phase of the strategy used
         self.actions_runs: List[List[ActTestsRun]] = []
 
     def __flat_failed_tests(self, runs):
-        return sum(map(lambda act_run: act_run.failed_tests, runs), [])
+        # JUnit <error> (e.g. import/fixture crashes) counts as failing too
+        return sum(
+            map(lambda act_run: act_run.failed_tests + act_run.erroring_tests, runs),
+            [],
+        )
 
     @property
     def prev_commit_passed(self):
@@ -124,6 +170,21 @@ class BugPatch:
             and len(self.__flat_failed_tests(self.actions_runs[0])) > 0
         )
 
+    @property
+    def prev_build_failed(self):
+        return (
+            self.actions_runs[0] is not None
+            and any(map(lambda run: run.failed, self.actions_runs[0]))
+        )
+
+    @property
+    def curr_build_passed(self):
+        return (
+            self.actions_runs[2] is not None
+            and not any(map(lambda run: run.failed, self.actions_runs[2]))
+            and len(self.__flat_failed_tests(self.actions_runs[2])) == 0
+        )
+
     def get_data(self):
         actions_runs = []
 
@@ -149,11 +210,17 @@ class BugPatch:
             "previous_commit_hash": self.previous_commit,
             "previous_commit_message": self.previous_commit_message,
             "previous_commit_timestamp": self.previous_commit_timestamp,
+            "previous_parent_hash": self.previous_parent_hash,
+            "incoming_diff": self.incoming_diff,
             "time_to_patch": self.time_to_patch,
             "bug_patch": str(self.bug_patch),
             "bug_patch_file_extensions": self.bug_patch_file_extensions,
             "test_patch": str(self.test_patch),
             "test_patch_file_extensions": self.test_patch_file_extensions,
+            "dependency_patch": str(self.dependency_patch),
+            "dependency_patch_file_extensions": self.dependency_patch_file_extensions,
+            "workflow_patch": str(self.workflow_patch),
+            "workflow_patch_file_extensions": self.workflow_patch_file_extensions,
             "non_code_patch": str(self.non_code_patch),
             "non_code_patch_file_extensions": self.non_code_patch_file_extensions,
             "change_type": self.change_type.name,
@@ -257,7 +324,7 @@ class BugPatch:
         github = GithubAPI()
         repo_full_name = bug["repository"]
 
-        return BugPatch(
+        bp = BugPatch(
             github.get_repo(repo_full_name),
             repo_clone.revparse_single(bug["commit_hash"]),
             repo_clone.revparse_single(bug["previous_commit_hash"]),
@@ -265,7 +332,17 @@ class BugPatch:
             PatchSet(bug["test_patch"]),
             PatchSet(bug["non_code_patch"]),
             set(),
+            dependency_patch=PatchSet(bug["dependency_patch"])
+            if "dependency_patch" in bug
+            else None,
+            workflow_patch=PatchSet(bug["workflow_patch"])
+            if "workflow_patch" in bug
+            else None,
+            previous_parent_hash=bug.get("previous_parent_hash"),
+            incoming_diff=bug.get("incoming_diff", ""),
         )
+        bp.strategy_used = bug.get("strategy", "UNKNOWN")
+        return bp
 
     def __remove_patch_index(self, patch: PatchSet) -> str:
         lines = str(patch).split("\n")
@@ -276,6 +353,8 @@ class BugPatch:
             (
                 self.__remove_patch_index(self.bug_patch),
                 self.__remove_patch_index(self.test_patch),
+                self.__remove_patch_index(self.dependency_patch),
+                self.__remove_patch_index(self.workflow_patch),
                 self.__remove_patch_index(self.non_code_patch),
             )
         )
@@ -288,6 +367,10 @@ class BugPatch:
             == self.__remove_patch_index(__value.bug_patch)
             and self.__remove_patch_index(self.test_patch)
             == self.__remove_patch_index(__value.test_patch)
+            and self.__remove_patch_index(self.dependency_patch)
+            == self.__remove_patch_index(__value.dependency_patch)
+            and self.__remove_patch_index(self.workflow_patch)
+            == self.__remove_patch_index(__value.workflow_patch)
             and self.__remove_patch_index(self.non_code_patch)
             == self.__remove_patch_index(__value.non_code_patch)
         )
