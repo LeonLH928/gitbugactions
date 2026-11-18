@@ -1,8 +1,11 @@
 import grp
+import io
 import logging
 import os
+import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import threading
 import time
@@ -25,20 +28,27 @@ from gitbugactions.utils.repo_state_manager import RepoStateManager
 class ActCacheDirManager:
     # We need to set a different cache dir for each worker to avoid conflicts
     # See https://github.com/nektos/act/issues/1885 -> "act's git actions download cache isn't process / thread safe"
-
+    # Use /var/tmp instead of /tmp because /tmp is tmpfs (RAM-limited to ~3.8G), while /var/tmp resides on the root SSD with ~85G.
+    __BASE_DIR: str = os.environ.get("ACT_CACHE_BASE", "/var/tmp/act-cache")
     __ACT_CACHE_DIR_LOCK: threading.Lock = threading.Lock()
     __ACT_CACHE_DIRS: Dict[str, bool] = dict()
     __DEFAULT_CACHE_DIR: str = os.path.join(
-        tempfile.gettempdir(), "act-cache", "default"
+        os.environ.get("ACT_CACHE_BASE", "/var/tmp/act-cache"), "default"
     )
 
     @classmethod
     def init_act_cache_dirs(cls, n_dirs: int):
         with cls.__ACT_CACHE_DIR_LOCK:
+            os.makedirs(cls.__BASE_DIR, exist_ok=True)
+            # Clean up stale uuid directories from previous dead runs to conserve disk space
+            for entry in os.scandir(cls.__BASE_DIR):
+                if entry.is_dir() and entry.name != "default":
+                    shutil.rmtree(entry.path, ignore_errors=True)
+
             # Generate the directories
             cls.__ACT_CACHE_DIRS = {
                 os.path.join(
-                    tempfile.gettempdir(), "act-cache", str(uuid.uuid4())
+                    cls.__BASE_DIR, str(uuid.uuid4())
                 ): True
                 for _ in range(n_dirs)
             }
@@ -112,7 +122,13 @@ class ActCacheDirManager:
 
             # Create a symlink to the action in every act cache dir
             for cache_dir in cls.__ACT_CACHE_DIRS:
-                os.symlink(action_dir, os.path.join(cache_dir, "act", action_dir_name))
+                symlink_path = os.path.join(cache_dir, "act", action_dir_name)
+                os.makedirs(os.path.dirname(symlink_path), exist_ok=True)
+                if not os.path.exists(symlink_path):
+                    try:
+                        os.symlink(action_dir, symlink_path)
+                    except FileExistsError:
+                        pass
         except Exception:
             logging.error(
                 f"Error while caching action {action.declaration}: {traceback.format_exc()}"
@@ -229,7 +245,7 @@ class Act:
     __ACT_PATH = "act"
     __ACT_CHECK = False
     __IMAGE_SETUP = False
-    __FLAGS = f"--pull=false --no-cache-server --max-parallel 1"
+    __FLAGS = f"--pull=false --no-cache-server --concurrent-jobs 1"
     __SETUP_LOCK = threading.Lock()
     __MEMORY_LIMIT = "7g"
     # Default base image to build the runner image from if none specified
@@ -256,16 +272,10 @@ class Act:
         """
         Act.__check_act()
         Act.__setup_image(runner_image, base_image)
-        if reuse:
-            self.flags = "--reuse"
-        else:
-            self.flags = "--rm"
-        # The flag -u allows files to be created with the current user
-        self.flags += f" --container-options '-u {os.getuid()}:{os.getgid()}"
-        if offline:
-            self.flags += " --network none"
-        self.flags += f" --memory={Act.__MEMORY_LIMIT}"
-        self.flags += "'"
+        self.reuse = reuse
+        self.offline = offline
+        # Run act with -b (bind working directory) and --reuse (keep container for export/extraction)
+        self.flags = "-b --reuse"
 
         self.__DEFAULT_RUNNERS = f"-P ubuntu-latest={runner_image}"
         self.timeout = timeout
@@ -290,7 +300,7 @@ class Act:
             client = DockerClient.getInstance()
             if Act.__IMAGE_SETUP:
                 return
-            elif len(client.images.list(name=runner_image)) == 1:
+            elif any(runner_image in tag or tag.endswith(runner_image) for img in client.images.list() for tag in img.tags):
                 Act.__IMAGE_SETUP = True
                 return
             elif runner_image != Act.__DEFAULT_IMAGE:
@@ -298,24 +308,36 @@ class Act:
                 exit(-1)
 
             # Creates crawler image
+            base = base_image if base_image else Act.__DEFAULT_BASE_IMAGE
+            logging.info(f"🐳 [Docker Setup] Runner image '{runner_image}' not found locally.")
+            logging.info(f"🐳 [Docker Setup] Building '{runner_image}' from base '{base}'...")
+            logging.info("🐳 [Docker Setup] Note: Pulling base image on first run may take several minutes...")
+            t_setup_start = time.time()
+
             if len(client.images.list(name="gitbugactions")) > 0:
                 client.images.remove(image="gitbugactions")
 
-            base = base_image if base_image else Act.__DEFAULT_BASE_IMAGE
             with open("Dockerfile", "w") as f:
                 client = DockerClient.getInstance()
                 dockerfile = f"FROM {base}\n"
-                dockerfile += f"RUN sudo usermod -u 4000000 runneradmin\n"
-                dockerfile += f"RUN sudo groupadd -o -g {os.getgid()} {grp.getgrgid(os.getgid()).gr_name}\n"
-                dockerfile += f"RUN sudo usermod -G {os.getgid()} runner\n"
-                dockerfile += f"RUN sudo usermod -o -u {os.getuid()} runner\n"
+                dockerfile += f"USER root\n"
+                dockerfile += f"RUN usermod -u 4000000 runneradmin && \\\n"
+                dockerfile += f"    (groupadd -o -g {os.getgid()} {grp.getgrgid(os.getgid()).gr_name} || true) && \\\n"
+                dockerfile += f"    usermod -G {os.getgid()} runner && \\\n"
+                dockerfile += f"    usermod -o -u {os.getuid()} runner && \\\n"
+                dockerfile += f"    curl -sL https://nodejs.org/dist/v20.18.0/node-v20.18.0-linux-x64.tar.gz -o /tmp/node.tar.gz && \\\n"
+                dockerfile += f"    tar -xzf /tmp/node.tar.gz -C /tmp && \\\n"
+                dockerfile += f"    cp -rf /tmp/node-v20.18.0-linux-x64/* /usr/local/ && \\\n"
+                dockerfile += f"    rm -rf /tmp/node.tar.gz /tmp/node-v20.18.0-linux-x64\n"
                 # Avoids problems with Rust projects in certain hosts
                 dockerfile += f'ENV RUSTUP_HOME="/usr/share/rust/.rustup"\n'
+                dockerfile += f"USER runner\n"
                 f.write(dockerfile)
 
-            client.images.build(path="./", tag="gitbugactions", forcerm=True)
+            client.images.build(path="./", tag="gitbugactions:latest", forcerm=True)
             os.remove("Dockerfile")
             Act.__IMAGE_SETUP = True
+            logging.info(f"✅ [Docker Setup] Runner image '{runner_image}' ready in {time.time() - t_setup_start:.1f}s!")
 
     @staticmethod
     def set_memory_limit(limit: str):
@@ -327,26 +349,113 @@ class Act:
         # Clean up before running
         RepoStateManager.clean_act_result_dir(repo_path)
 
+        run_uuid = str(uuid.uuid4())
+        container_opts = f"-u {os.getuid()}:{os.getgid()} --memory={Act.__MEMORY_LIMIT}"
+        if self.offline:
+            container_opts += " --network none"
+        container_opts += f" --label gitbugactions_run={run_uuid}"
+
         command = f"cd {repo_path}; "
-        command += f"ACT_DISABLE_VERSION_CHECK=1 XDG_CACHE_HOME='{act_cache_dir}' timeout {self.timeout * 60} {Act.__ACT_PATH} {self.__DEFAULT_RUNNERS} {Act.__FLAGS} {self.flags}"
+        command += f"ACT_DISABLE_VERSION_CHECK=1 XDG_CACHE_HOME='{act_cache_dir}' timeout {self.timeout * 60} {Act.__ACT_PATH} {self.__DEFAULT_RUNNERS} {Act.__FLAGS} {self.flags} --container-options '{container_opts}'"
         if GithubToken.has_tokens():
             token: GithubToken = GithubToken.get_token()
             command += f" -s GITHUB_TOKEN={token.token}"
         command += f" -W {workflow.path}"
 
-        logging.debug(f"Running command: {command}")
+        wf_display = workflow.path if hasattr(workflow, "path") else "workflow"
+        logging.info(f"      [Act Engine] Executing '{wf_display}' via act (timeout: {self.timeout}m)...")
+
+        client = DockerClient.getInstance()
+        pre_existing_container_ids = set()
+        try:
+            pre_existing_container_ids = {c.id for c in client.containers.list(all=True)}
+        except Exception as e:
+            logging.debug(f"Could not list pre-existing containers: {e}")
+
         start_time = time.time()
         run = subprocess.run(command, shell=True, capture_output=True)
         end_time = time.time()
+        dur = end_time - start_time
+        logging.info(f"      [Act Engine] Finished in {dur:.1f}s (exit code: {run.returncode})")
+
+        # Under rootless podman, act chowns repo_path to container user (mapped to subuids on host).
+        # Restore host user ownership so host python can read test reports and delete temp files cleanly.
+        subprocess.run(
+            ["podman", "unshare", "chown", "-R", "0:0", repo_path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
         stdout = run.stdout.decode("utf-8")
         stderr = run.stderr.decode("utf-8")
 
-        tests = workflow.get_test_results(
-            os.path.join(
-                repo_path, ".act-result", os.path.basename(os.path.normpath(repo_path))
+        new_containers = []
+        try:
+            new_containers = client.containers.list(
+                all=True, filters={"label": f"gitbugactions_run={run_uuid}"}
             )
-        )
+        except Exception as e:
+            logging.debug(f"Could not list containers by label: {e}")
+
+        if not new_containers:
+            try:
+                wf_name = str(workflow.doc.get("name", ""))
+                clean_wf = re.sub(r"[^a-zA-Z0-9_.-]", "-", wf_name) if wf_name else ""
+                wf_file = os.path.splitext(os.path.basename(workflow.path))[0]
+                clean_file = re.sub(r"[^a-zA-Z0-9_.-]", "-", wf_file)
+
+                for c in client.containers.list(all=True):
+                    if c.id not in pre_existing_container_ids:
+                        if clean_wf and clean_wf[:25] in c.name:
+                            new_containers.append(c)
+                        elif clean_file and clean_file[:25] in c.name:
+                            new_containers.append(c)
+            except Exception as e:
+                logging.debug(f"Could not list new containers fallback: {e}")
+
+        tests = workflow.get_test_results(repo_path)
+        if not tests:
+            for container in new_containers:
+                try:
+                    with tempfile.TemporaryDirectory() as extract_dir:
+                        stream, _ = container.get_archive(repo_path)
+                        file_bytes = b"".join(stream)
+                        with tarfile.open(fileobj=io.BytesIO(file_bytes)) as tar:
+                            tar.extractall(path=extract_dir)
+                        extracted_repo = os.path.join(
+                            extract_dir, os.path.basename(os.path.normpath(repo_path))
+                        )
+                        extracted_tests = workflow.get_test_results(extracted_repo)
+                        if not extracted_tests:
+                            extracted_tests = workflow.get_test_results(extract_dir)
+                        if extracted_tests:
+                            tests = extracted_tests
+                            break
+                except Exception as e:
+                    logging.debug(
+                        f"Could not extract test results from container {container.name}: {e}"
+                    )
+
+        if not self.reuse:
+            for container in new_containers:
+                try:
+                    container.stop(timeout=1)
+                except Exception:
+                    pass
+                try:
+                    container.remove(v=True, force=True)
+                except Exception:
+                    pass
+
+        if not tests:
+            tests = workflow.get_test_results(
+                os.path.join(
+                    repo_path,
+                    ".act-result",
+                    os.path.basename(os.path.normpath(repo_path)),
+                )
+            )
 
         tests_run = ActTestsRun(
             failed=False,
@@ -469,7 +578,15 @@ class GitHubActions:
 
     def delete_workflow(self, workflow):
         if os.path.exists(workflow.path):
-            os.remove(workflow.path)
+            try:
+                os.remove(workflow.path)
+            except PermissionError:
+                subprocess.run(
+                    ["podman", "unshare", "rm", "-f", workflow.path],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
 
     def remove_workflow(self, rem_workflow):
         for i, workflow in enumerate(self.test_workflows):

@@ -116,7 +116,18 @@ class TestExecutor:
                 test_actions.test_workflows.append(new_workflow)
 
         temp_workflow_path = None
-        if len(test_actions.test_workflows) == 0:
+        if len(test_actions.test_workflows) == 0 and len(test_actions.workflows) > 0:
+            # ponytail: existing workflow has broken test command (Type C); run it so it fails instead of masking with template
+            for wf in test_actions.workflows:
+                wf.instrument_os()
+                wf.instrument_on_events()
+                wf.path = os.path.join(
+                    os.path.dirname(wf.path),
+                    os.path.splitext(os.path.basename(wf.path))[0]
+                    + "-gitbugactions-crawler.yml",
+                )
+                test_actions.test_workflows.append(wf)
+        elif len(test_actions.test_workflows) == 0:
             temp_workflow_path = TemplateWorkflowManager.create_temp_workflow(
                 self.repo_clone.workdir, self.language
             )
