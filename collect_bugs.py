@@ -66,7 +66,7 @@ class PatchCollector:
         self.pull_requests = kwargs.get("pull_requests", False)
         self.filter_linked_to_pr = kwargs.get("filter_linked_to_pr", None)
         self.max_commits = kwargs.get("max_commits", None)
-        self.cap_normal_pass = kwargs.get("cap_normal_pass", True)
+        self.cap_normal_pass = kwargs.get("cap_normal_pass", False)
         self.normal_pass_count = 0
 
     def __clone_repo(self):
@@ -173,18 +173,17 @@ class PatchCollector:
             def all_runs_crashed(x):
                 return x is None or all(map(lambda act_run: act_run.failed, x))
 
-            active_strategy_names = [s.name for s in TestConfig.strategies]
-            allows_prev_crash = (
-                ("DEPENDENCY_CONFLICT" in active_strategy_names and len(bug.dependency_patch) > 0)
-                or ("PIPELINE_CONFIG" in active_strategy_names and len(bug.workflow_patch) > 0)
-                or any(name in active_strategy_names for name in ("FAIL_PASS_BUILD", "FAIL_FAIL"))
-            )
-
             # Previous commit
             act_runs = bug.test_previous_commit(executor)
-            if act_runs is None or (
-                all_runs_crashed(act_runs) and not allows_prev_crash
-            ):
+            if act_runs is None:
+                return test_patch_runs
+            prev_tests_count = sum(len(r.tests) for r in act_runs)
+            allows_prev_crash = (
+                prev_tests_count > 0
+                or len(bug.dependency_patch) > 0
+                or len(bug.workflow_patch) > 0
+            )
+            if all_runs_crashed(act_runs) and not allows_prev_crash:
                 return test_patch_runs
             test_patch_runs[0] = act_runs
 
@@ -386,11 +385,12 @@ class PatchCollector:
                 actions: Set[Action] = set()
                 actions.update(self.__get_used_actions(str(commit.id)))
                 actions.update(self.__get_used_actions(str(previous_commit.id)))
-                actions.update(self.__get_template_actions())
 
                 prev_parent_hash, incoming_diff = self._get_incoming_diff(
                     self.repo_clone, previous_commit
                 )
+                if prev_parent_hash is None:
+                    continue
                 bp = BugPatch(
                     self.repo,
                     commit,
@@ -553,11 +553,12 @@ class PatchCollector:
                     actions: Set[Action] = set()
                     actions.update(self.__get_used_actions(str(commit.id)))
                     actions.update(self.__get_used_actions(str(previous_commit.id)))
-                    actions.update(self.__get_template_actions())
 
                     prev_parent_hash, incoming_diff = self._get_incoming_diff(
                         self.repo_clone, previous_commit
                     )
+                    if prev_parent_hash is None:
+                        continue
                     # Create a BugPatch object
                     patch = BugPatch(
                         self.repo,
@@ -647,7 +648,7 @@ def collect_bugs(
     commit_list_file: str = None,
     collect_passing_commits: bool = False,
     max_commits: int = None,
-    cap_normal_pass: bool = True,
+    cap_normal_pass: bool = False,
 ):
     """Collects bug-fixes from the repos listed in `data_path`. The result is saved
     on `results_path`. A file `data.json` is also created with information about
