@@ -5,6 +5,8 @@ import logging
 import os
 import sys
 import tempfile
+import threading
+import time
 import traceback
 import uuid
 
@@ -57,12 +59,19 @@ def run_workflow(repo_path, workflow, language, base_image=None):
 
 
 class CollectReposStrategy(RepoStrategy):
-    def __init__(self, data_path: str, use_template_workflows: bool = True):
+    def __init__(
+        self,
+        data_path: str,
+        use_template_workflows: bool = True,
+        max_repos: Optional[int] = None,
+    ):
         self.data_path = data_path
         self.uuid = str(uuid.uuid1())
-        self.use_template_workflows = (
-            use_template_workflows  # Flag to control template workflow usage
-        )
+        self.use_template_workflows = use_template_workflows
+        self.max_repos = max_repos
+        self.counter = 0
+        self.success_counter = 0
+        self.lock = threading.Lock()
 
     def save_data(self, data: dict, repo):
         """
@@ -74,20 +83,31 @@ class CollectReposStrategy(RepoStrategy):
             json.dump(data, f, indent=4)
 
     def handle_repo(self, repo: Repository):
-        logging.info(f"Cloning {repo.full_name} - {repo.clone_url}")
+        with self.lock:
+            self.counter += 1
+            idx = self.counter
+        target_str = f"/{self.max_repos}" if self.max_repos else ""
+        logging.info(
+            f"⏳ [Repo {idx}{target_str}] Bắt đầu xử lý: {repo.full_name} "
+            f"({repo.stargazers_count} ⭐, lang: {repo.language})"
+        )
+
         repo_path = os.path.join(
             tempfile.gettempdir(), self.uuid, repo.full_name.replace("/", "-")
         )
 
         # Handle repositories without a language detected
-        if repo.language is None:
-            logging.info(f"Skipping {repo.full_name} - no language detected")
+        lang = repo.language
+        if lang is None and isinstance(getattr(repo, "get_languages", lambda: None)(), dict):
+            lang = next(iter(repo.get_languages()), None)
+        if lang is None:
+            logging.info(f"   ↳ ⏭️ [Repo {idx}{target_str}] Bỏ qua {repo.full_name}: không xác định được ngôn ngữ")
             return
 
         data = {
             "repository": repo.full_name,
             "stars": repo.stargazers_count,
-            "language": repo.language.strip().lower(),
+            "language": lang.strip().lower(),
             "size": repo.size,
             "clone_url": repo.clone_url,
             "timestamp": datetime.datetime.now(datetime.UTC).isoformat() + "Z",
@@ -98,12 +118,15 @@ class CollectReposStrategy(RepoStrategy):
             "using_template_workflow": False,  # Track if we used a template workflow
         }
 
+        t_clone = time.time()
+        logging.info(f"   ↳ 📥 [Repo {idx}{target_str}] Đang clone {repo.full_name} ({repo.size} KB)...")
         repo_clone = clone_repo(repo.clone_url, repo_path)
+        logging.info(f"   ↳ 📦 [Repo {idx}{target_str}] Clone xong trong {time.time() - t_clone:.1f}s")
 
         try:
             data["clone_success"] = True
 
-            actions = GitHubActions(repo_path, repo.language)
+            actions = GitHubActions(repo_path, lang)
             data["number_of_actions"] = len(actions.workflows)
             data["actions_build_tools"] = [
                 x.get_build_tool() for x in actions.workflows
@@ -113,37 +136,63 @@ class CollectReposStrategy(RepoStrategy):
                 x.get_build_tool() for x in actions.test_workflows
             ]
             actions.save_workflows()
+            logging.info(
+                f"   ↳ 📋 [Repo {idx}{target_str}] Workflows: {len(actions.workflows)} tổng số, "
+                f"{len(actions.test_workflows)} test workflow(s)"
+            )
 
             # Check if we have test workflows, otherwise use a template if enabled
             if len(actions.test_workflows) == 0 and self.use_template_workflows:
                 logging.info(
-                    f"No test workflows found, creating template for {repo.full_name}"
+                    f"   ↳ 🛠️ [Repo {idx}{target_str}] Không có test workflow, tạo template cho {repo.full_name}"
                 )
 
                 # Create a template workflow
-                TemplateWorkflowManager.create_temp_workflow(repo_path, repo.language)
+                TemplateWorkflowManager.create_temp_workflow(repo_path, lang)
                 # Create a new actions instance to include our template
-                actions = GitHubActions(repo_path, repo.language)
+                actions = GitHubActions(repo_path, lang)
                 data["using_template_workflow"] = True
                 actions.save_workflows()
 
-            # If we have a test workflow, run it
-            if len(actions.test_workflows) == 1:
-                logging.info(f"Running actions for {repo.full_name}")
+            # If we have at least one test workflow, run it
+            if len(actions.test_workflows) >= 1:
+                wf_path = actions.test_workflows[0].path
+                logging.info(
+                    f"   ↳ 🏃 [Repo {idx}{target_str}] Chạy test workflow '{wf_path}' qua Act "
+                    f"({len(actions.test_workflows)} workflows tìm thấy)..."
+                )
 
                 act_run = run_workflow(
                     repo_path,
                     actions.test_workflows[0],
-                    repo.language,
+                    lang,
                 )
                 data["actions_successful"] = not act_run.failed
                 data["actions_run"] = act_run.asdict()
+                res_str = "SUCCESS" if not act_run.failed else "FAILED"
+                num_tests = len(act_run.tests) if act_run.tests else 0
+                logging.info(
+                    f"   ↳ 🏁 [Repo {idx}{target_str}] Act hoàn tất trong {act_run.elapsed_time:.1f}s | "
+                    f"Kết quả: {res_str} | Tests: {num_tests}"
+                )
+            else:
+                logging.info(
+                    f"   ↳ ℹ️ [Repo {idx}{target_str}] Không tìm thấy test workflow nào, bỏ qua chạy test"
+                )
 
             delete_repo_clone(repo_clone)
             self.save_data(data, repo)
+            with self.lock:
+                if data["actions_successful"]:
+                    self.success_counter += 1
+                curr_saved = self.success_counter
+            logging.info(
+                f"   ↳ 💾 [Repo {idx}{target_str}] Đã lưu metadata | "
+                f"Repos CI/CD thành công: {curr_saved}/{idx}"
+            )
         except Exception as e:
             logging.error(
-                f"Error while processing {repo.full_name}: {traceback.format_exc()}"
+                f"   ↳ ❌ [Repo {idx}{target_str}] Lỗi khi xử lý {repo.full_name}: {traceback.format_exc()}"
             )
 
             delete_repo_clone(repo_clone)
@@ -280,6 +329,8 @@ def collect_repos(
     use_template_workflows: bool = True,
     cleanup_interval: int = 100,
     enable_cleanup: bool = False,
+    max_repos: Optional[int] = None,
+    output_path: Optional[str] = None,
 ):
     """Collect the repositories from GitHub that match the query and have executable
     GitHub Actions workflows with parsable tests.
@@ -294,9 +345,29 @@ def collect_repos(
         use_template_workflows (bool, optional): Whether to use template workflows for repos without test workflows. Defaults to True.
         cleanup_interval (int, optional): Number of jobs after which to run the cleanup function. Defaults to 100.
         enable_cleanup (bool, optional): Whether to enable the periodic cleanup function. Defaults to False.
+        max_repos (int, optional): Maximum number of repositories to crawl. Defaults to None.
+        output_path (str, optional): Alias for out_path.
     """
+    out_path = output_path or out_path
+    if out_path.endswith(".json"):
+        out_path = os.path.dirname(out_path) or "./out/"
+
     if not Path(out_path).exists():
         os.makedirs(out_path, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
+    logging.info("=" * 60)
+    logging.info("🚀 Bước 1: Bắt đầu thu thập Repositories có CI/CD từ GitHub")
+    logging.info(f"🚀 Query: '{query}'")
+    logging.info(f"🚀 Workers: {n_workers} | Max repos: {max_repos or 'Unlimited'} | Output: {out_path}")
+    logging.info("=" * 60)
+    t_step1_start = time.time()
 
     Act(base_image=base_image)  # Initialize Act with base_image
 
@@ -309,8 +380,22 @@ def collect_repos(
         n_workers=n_workers,
         cleanup_interval=cleanup_interval,
         cleanup_function=cleanup_function,
+        max_repos=max_repos,
     )
-    crawler.get_repos(CollectReposStrategy(out_path, use_template_workflows))
+    strategy = CollectReposStrategy(
+        out_path, use_template_workflows=use_template_workflows, max_repos=max_repos
+    )
+    crawler.get_repos(strategy)
+
+    t_step1_dur = time.time() - t_step1_start
+    logging.info("=" * 60)
+    logging.info(f"🎉 Bước 1 hoàn thành sau {t_step1_dur:.1f}s!")
+    logging.info(
+        f"🎉 Tổng repos đã quét: {strategy.counter} | "
+        f"Số repos có CI/CD thành công: {strategy.success_counter}"
+    )
+    logging.info(f"🎉 Metadata lưu tại: {out_path}")
+    logging.info("=" * 60)
 
 
 def main():

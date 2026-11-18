@@ -106,12 +106,21 @@ class GithubToken:
         with self.lock_rate:
             if time.time() - self.last_update > GithubToken.__UPDATE_RATE_INTERVAL:
                 rate_limit = self.github.get_rate_limit()
-                self.search_rate_limiter.update_requests(
-                    rate_limit.search.limit - rate_limit.search.remaining
+                search_rate = getattr(
+                    rate_limit, "search", getattr(rate_limit.resources, "search", None)
                 )
-                self.core_rate_limiter.update_requests(
-                    rate_limit.core.limit - rate_limit.core.remaining
+                core_rate = getattr(
+                    rate_limit, "core", getattr(rate_limit.resources, "core", None)
                 )
+                if search_rate:
+                    self.search_rate_limiter.update_requests(
+                        search_rate.limit - search_rate.remaining
+                    )
+                if core_rate:
+                    self.core_rate_limiter.update_requests(
+                        core_rate.limit - core_rate.remaining
+                    )
+                self.last_update = time.time()
 
     @staticmethod
     def has_tokens() -> bool:
@@ -133,12 +142,20 @@ class GithubToken:
         if len(GithubToken.__TOKENS) == 0:
             return
 
-        soonest_reset = GithubToken.__TOKENS[0].github.get_rate_limit().core.reset
+        r0 = GithubToken.__TOKENS[0].github.get_rate_limit()
+        core0 = getattr(r0, "core", getattr(r0.resources, "core", None))
+        soonest_reset = core0.reset if core0 else None
         for token in GithubToken.__TOKENS[1:]:
-            reset = token.github.get_rate_limit().core.reset
-            if reset < soonest_reset:
+            r = token.github.get_rate_limit()
+            core = getattr(r, "core", getattr(r.resources, "core", None))
+            reset = core.reset if core else None
+            if reset and soonest_reset and reset < soonest_reset:
                 soonest_reset = reset
-        time.sleep((datetime.now() - soonest_reset).total_seconds())
+        if soonest_reset:
+            now = datetime.now(soonest_reset.tzinfo) if soonest_reset.tzinfo else datetime.now()
+            sleep_sec = (soonest_reset - now).total_seconds()
+            if sleep_sec > 0:
+                time.sleep(sleep_sec)
 
     @staticmethod
     def get_token() -> "GithubToken":

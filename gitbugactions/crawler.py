@@ -12,8 +12,12 @@ from github import Repository
 from gitbugactions.actions.actions import ActCacheDirManager
 from gitbugactions.github_api import GithubAPI
 
-# FIXME change to custom logger
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
 
 
 class RepoStrategy(ABC):
@@ -36,6 +40,7 @@ class RepoCrawler:
         n_workers: int = 1,
         cleanup_interval: int = 100,
         cleanup_function: Optional[Callable] = None,
+        max_repos: Optional[int] = None,
     ):
         """
         Args:
@@ -49,6 +54,7 @@ class RepoCrawler:
             n_workers (int): Number of worker threads for parallel processing
             cleanup_interval (int): Number of jobs after which to run the cleanup function
             cleanup_function (Callable): Function to run periodically for cleanup
+            max_repos (int, optional): Maximum number of repositories to process. Defaults to None.
         """
         self.github: GithubAPI = GithubAPI(
             per_page=RepoCrawler.__PAGE_SIZE,
@@ -57,6 +63,8 @@ class RepoCrawler:
         self.pagination_freq: str = pagination_freq
         self.requests: int = 0
         self.n_workers = n_workers
+        self.max_repos = max_repos
+        self.repos_submitted = 0
         self.executor = ThreadPoolExecutor(max_workers=self.n_workers)
         self.futures = []
         self.completed_jobs = 0
@@ -111,9 +119,15 @@ class RepoCrawler:
 
     def __wait_for_completion(self):
         """Wait for all current futures to complete"""
-        for future in tqdm.tqdm(as_completed(self.futures)):
-            future.result()
-            self.completed_jobs += 1
+        total = len(self.futures)
+        if total > 0:
+            logging.info(f"⏳ [Crawler] Waiting for {total} background repo tasks to finish...")
+            completed = 0
+            for future in tqdm.tqdm(as_completed(self.futures), total=total, desc="Repos Progress"):
+                future.result()
+                completed += 1
+                self.completed_jobs += 1
+                logging.info(f"🏁 [Crawler] Finished {completed}/{total} repo tasks (Overall completed: {self.completed_jobs})")
         self.futures = []
 
     def __run_cleanup_if_needed(self):
@@ -133,7 +147,7 @@ class RepoCrawler:
             logging.info("Cleanup completed, resuming repository collection")
 
     def __search_repos(self, query: str, repo_strategy: RepoStrategy):
-        logging.info(f"Searching repos with query: {query}")
+        logging.info(f"🔍 [Crawler] Searching repos on GitHub: '{query}'")
         page_list = self.github.search_repositories(query)
         totalCount = self.github.token.search_rate_limiter.request(
             getattr, page_list, "totalCount"
@@ -143,17 +157,27 @@ class RepoCrawler:
             return
         elif totalCount == 1000:
             logging.warning(
-                f"1000 results limit of the GitHub API was reached.\nQuery: {query}"
+                f"⚠️ 1000 results limit of the GitHub API was reached.\nQuery: {query}"
             )
+        target_info = f" (max target: {self.max_repos} repos)" if self.max_repos else ""
+        logging.info(f"📊 [Crawler] Found {totalCount} matching repos on GitHub{target_info}")
         n_pages = math.ceil(totalCount / RepoCrawler.__PAGE_SIZE)
         for p in range(n_pages):
+            if self.max_repos is not None and self.repos_submitted >= self.max_repos:
+                logging.info(f"🛑 [Crawler] Reached max_repos target ({self.max_repos}), stopping search.")
+                break
+            logging.info(f"📄 [Crawler] Fetching search page {p + 1}/{n_pages}...")
             repos = self.github.token.search_rate_limiter.request(page_list.get_page, p)
             results = []
             for repo in repos:
+                if self.max_repos is not None and self.repos_submitted >= self.max_repos:
+                    break
                 args = (repo,)
                 self.futures.append(
                     self.executor.submit(repo_strategy.handle_repo, *args)
                 )
+                self.repos_submitted += 1
+                logging.info(f"   ↳ 📥 [Queue {self.repos_submitted}{target_info}] Queued {repo.full_name} ({repo.stargazers_count} ⭐, {repo.language})")
                 # Check if we need to run cleanup after adding this job
                 self.__run_cleanup_if_needed()
 
