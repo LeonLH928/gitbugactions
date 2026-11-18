@@ -4,6 +4,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import traceback
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -106,17 +107,29 @@ def filter_bug(
     base_image: str | None = None,
     use_default_actions: bool = False,
 ) -> str:
+    owns_image = False
     try:
         repo_name = bug["repository"].replace("/", "-")
         bug_patch: BugPatch = BugPatch.from_dict(bug, repo_clone)
         diff_folder_path = os.path.join(export_path, repo_name, bug_patch.commit)
+        logging.info(
+            f"   ↳ [Filter Run] Đang kiểm tra tính lặp lại {n_executions} lần cho "
+            f"{bug['repository']}@{bug['commit_hash'][:8]} (strategy: {bug.get('strategy', 'N/A')})..."
+        )
+        t_filter0 = time.time()
 
         Act(base_image=base_image)  # Pass base_image to Act initialization
         image_name = f"gitbugactions-run-bug:{str(uuid.uuid4())}"
         docker_client = DockerClient.getInstance()
-        create_diff_image(
-            "gitbugactions:latest", image_name, get_diff_path(diff_folder_path)
+        # Export is skipped for failing current commits (Type E): fall back to base image
+        diff_path = (
+            get_diff_path(diff_folder_path) if os.path.isdir(diff_folder_path) else None
         )
+        owns_image = diff_path is not None
+        if owns_image:
+            create_diff_image("gitbugactions:latest", image_name, diff_path)
+        else:
+            image_name = "gitbugactions:latest"
 
         previous_commit_runs = []
         previous_commit_with_diff_runs = []
@@ -157,52 +170,110 @@ def filter_bug(
             )
             current_commit_runs.append(run)
 
-        # It is a fail if all runs are empty
+        strategy = bug.get("strategy", "")
+        is_build_strategy = strategy in (
+            "DEPENDENCY_CONFLICT",
+            "PIPELINE_CONFIG",
+        )
+
+        for runs_group in (
+            previous_commit_runs,
+            previous_commit_with_diff_runs,
+            current_commit_runs,
+        ):
+            for run_list in runs_group:
+                for act_run in run_list or []:
+                    if act_run.return_code == 124 or "exitcode '137'" in (
+                        (act_run.stdout or "") + (act_run.stderr or "")
+                    ):
+                        bug["infra_failure"] = True
+
+        curr_empty = all(
+            run is None or len(run) == 0 or run[0].tests is None or len(run[0].tests) == 0
+            for run in current_commit_runs
+        )
+        prev_empty = all(
+            run is None or len(run) == 0 or run[0].tests is None or len(run[0].tests) == 0
+            for run in previous_commit_runs
+        )
+
+        # It is a fail if current commit runs had no tests, or (for test-based strategies) if previous had no tests
+        if curr_empty or (not is_build_strategy and prev_empty):
+            return "FAIL"
+
         if (
-            all(
-                run[0].tests is None or len(run[0].tests) == 0
-                for run in previous_commit_runs
-            )
-            or (
-                len(bug_patch.test_patch) != 0
-                and any(
-                    run[0].tests is None or len(run[0].tests) == 0
-                    for run in previous_commit_with_diff_runs
-                )
-            )
-            or all(
-                run[0].tests is None or len(run[0].tests) == 0
-                for run in current_commit_runs
+            not is_build_strategy
+            and len(bug_patch.test_patch) != 0
+            and any(
+                run is None or len(run) == 0 or run[0].tests is None or len(run[0].tests) == 0
+                for run in previous_commit_with_diff_runs
             )
         ):
             return "FAIL"
-        # It is flaky if at least one is different
-        elif (
-            any(
-                not equal_test_results(bug["actions_runs"][0][0]["tests"], run[0].tests)
-                for run in previous_commit_runs
-            )
-            or (
-                len(bug_patch.test_patch) != 0
-                and any(
-                    not equal_test_results(
-                        bug["actions_runs"][1][0]["tests"], run[0].tests
-                    )
-                    for run in previous_commit_with_diff_runs
-                )
-            )
-            or any(
-                not equal_test_results(bug["actions_runs"][2][0]["tests"], run[0].tests)
-                for run in current_commit_runs
-            )
+
+        if bug.get("infra_failure"):
+            return "FAIL"
+
+        # It is flaky if at least one run produces different test results
+        is_flaky = False
+        if (
+            not is_build_strategy
+            and bug.get("actions_runs")
+            and len(bug["actions_runs"]) > 0
+            and bug["actions_runs"][0]
+            and bug["actions_runs"][0][0].get("tests")
         ):
+            if any(
+                run is None
+                or not equal_test_results(
+                    bug["actions_runs"][0][0]["tests"], run[0].tests
+                )
+                for run in previous_commit_runs
+            ):
+                is_flaky = True
+
+        if (
+            not is_flaky
+            and not is_build_strategy
+            and len(bug_patch.test_patch) != 0
+            and bug.get("actions_runs")
+            and len(bug["actions_runs"]) > 1
+            and bug["actions_runs"][1]
+            and bug["actions_runs"][1][0].get("tests")
+        ):
+            if any(
+                run is None
+                or not equal_test_results(
+                    bug["actions_runs"][1][0]["tests"], run[0].tests
+                )
+                for run in previous_commit_with_diff_runs
+            ):
+                is_flaky = True
+
+        if (
+            not is_flaky
+            and bug.get("actions_runs")
+            and len(bug["actions_runs"]) > 2
+            and bug["actions_runs"][2]
+            and bug["actions_runs"][2][0].get("tests")
+        ):
+            if any(
+                run is None
+                or not equal_test_results(
+                    bug["actions_runs"][2][0]["tests"], run[0].tests
+                )
+                for run in current_commit_runs
+            ):
+                is_flaky = True
+
+        if is_flaky:
             return "FLAKY"
-        # It is non-flaky if not all runs are empty and all are equal
-        else:
-            return "NON-FLAKY"
+        # It is non-flaky if not empty and all runs are deterministic
+        return "NON-FLAKY"
     finally:
         # delete_repo_clone(repo_clone)
-        docker_client.images.remove(image_name, force=True)
+        if owns_image:
+            docker_client.images.remove(image_name, force=True)
 
 
 def filter_bugs(
@@ -230,6 +301,39 @@ def filter_bugs(
     ActCacheDirManager.init_act_cache_dirs(n_dirs=n_workers)
     executor = ThreadPoolExecutor(max_workers=n_workers)
 
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
+    logging.info("=" * 60)
+    logging.info("🚀 Bước 4: Lọc Flaky & Kiểm định Reproducibility")
+    logging.info(f"🚀 N_Executions: {n_executions} lần | Offline: {offline} | Workers: {n_workers}")
+    logging.info(f"🚀 Nguồn bugs: {bugs_path} -> Kết quả lọc: {res_path}")
+    logging.info("=" * 60)
+    t_step4_start = time.time()
+
+    if not os.path.exists(bugs_path):
+        logging.warning(f"Bugs path '{bugs_path}' does not exist. No bugs to filter.")
+        return
+
+    # Load existing verified commits from res_path if available
+    existing_filtered: Dict[Tuple[str, str], str] = {}
+    status_stats = {"NON-FLAKY": 0, "FLAKY": 0, "FAIL": 0}
+    if os.path.exists(res_path):
+        for fname, default_stat in [("non-flaky.json", "NON-FLAKY"), ("flaky.json", "FLAKY"), ("fail.json", "FAIL")]:
+            fpath = os.path.join(res_path, fname)
+            if os.path.exists(fpath):
+                with open(fpath, "r") as f:
+                    for line in f:
+                        if line.strip():
+                            rec = json.loads(line)
+                            st = rec.get("status", default_stat)
+                            existing_filtered[(rec["repository"], rec["commit"])] = st
+                            status_stats[st] = status_stats.get(st, 0) + 1
+
     with ThreadPoolExecutor(max_workers=n_workers) as executor:
         future_to_bug: Dict[Future, Dict] = {}
 
@@ -249,6 +353,13 @@ def filter_bugs(
             try:
                 for bug in bugs:
                     bug = json.loads(bug)
+                    repo_key = (bug["repository"], bug["commit_hash"])
+                    if repo_key in existing_filtered:
+                        logging.info(
+                            f"   ↳ [Filter Run] ⚡ Bỏ qua vì đã kiểm định: {bug['repository']}@{bug['commit_hash'][:8]} ({existing_filtered[repo_key]})"
+                        )
+                        continue
+
                     new_repo_path = os.path.join(
                         tempfile.gettempdir(), str(uuid.uuid4())
                     )
@@ -271,7 +382,12 @@ def filter_bugs(
                 # delete_repo_clone(repo_clone)
                 pass
 
-        for future in tqdm.tqdm(as_completed(future_to_bug), total=len(future_to_bug)):
+        total_filter = len(future_to_bug)
+        logging.info(f"🔬 Tìm thấy {total_filter} commits cần kiểm định flakiness ({n_executions} executions mỗi commit, {len(existing_filtered)} đã cached)...")
+        filter_idx = 0
+
+        for future in tqdm.tqdm(as_completed(future_to_bug), total=total_filter, desc="Filtering flakiness"):
+            filter_idx += 1
             try:
                 bug = future_to_bug[future]
                 repository = bug["repository"]
@@ -279,29 +395,45 @@ def filter_bugs(
                 status = future.result()
             except Exception:
                 logging.error(
-                    f"Error testing flakiness on {repository}@{commit}: {traceback.format_exc()}"
+                    f"   ↳ [{filter_idx}/{total_filter}] ❌ Lỗi kiểm tra flakiness trên {repository}@{commit}: {traceback.format_exc()}"
                 )
             else:
+                status_stats[status] = status_stats.get(status, 0) + 1
+                logging.info(
+                    f"   ↳ [{filter_idx}/{total_filter}] {repository}@{commit[:8]} "
+                    f"({bug.get('strategy', 'N/A')}) -> KẾT QUẢ: {status} | "
+                    f"(Non-Flaky: {status_stats.get('NON-FLAKY', 0)}, Flaky: {status_stats.get('FLAKY', 0)}, Fail: {status_stats.get('FAIL', 0)})"
+                )
                 if not Path(res_path).exists():
                     Path(res_path).mkdir(parents=True, exist_ok=True)
+                record = {
+                    "repository": repository,
+                    "commit": commit,
+                    "strategy": bug.get("strategy", "UNKNOWN"),
+                    "status": status,
+                }
+                if bug.get("infra_failure"):
+                    record["infra_failure"] = True
                 if status == "NON-FLAKY":
                     with open(os.path.join(res_path, "non-flaky.json"), "a") as f:
-                        f.write(
-                            json.dumps({"repository": repository, "commit": commit})
-                            + "\n"
-                        )
+                        f.write(json.dumps(record) + "\n")
                 elif status == "FAIL":
                     with open(os.path.join(res_path, "fail.json"), "a") as f:
-                        f.write(
-                            json.dumps({"repository": repository, "commit": commit})
-                            + "\n"
-                        )
+                        f.write(json.dumps(record) + "\n")
                 elif status == "FLAKY":
                     with open(os.path.join(res_path, "flaky.json"), "a") as f:
-                        f.write(
-                            json.dumps({"repository": repository, "commit": commit})
-                            + "\n"
-                        )
+                        f.write(json.dumps(record) + "\n")
+
+    t_step4_dur = time.time() - t_step4_start
+    logging.info("=" * 60)
+    logging.info(f"🎉 Bước 4 hoàn thành sau {t_step4_dur:.1f}s!")
+    logging.info(
+        f"🎉 Kết quả kiểm định: NON-FLAKY: {status_stats.get('NON-FLAKY', 0)} | "
+        f"FLAKY (Type D1): {status_stats.get('FLAKY', 0)} | "
+        f"FAIL (Type D2 / Unsound): {status_stats.get('FAIL', 0)}"
+    )
+    logging.info(f"🎉 Kết quả lưu tại: {res_path}")
+    logging.info("=" * 60)
 
 
 def main():

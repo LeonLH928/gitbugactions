@@ -253,6 +253,7 @@ def extract_diff(container_id: str, diff_file_path: str, ignore_paths: List[str]
             # if a directory was created we can download all the content there
             elif child.is_file or child.kind == 1:
                 path = os.path.join(save_path, child.full_path[1:])
+                os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(f"{path}.tar", "wb") as f:
                     bits, _ = container.get_archive(child.full_path)
                     for chunk in bits:
@@ -266,7 +267,7 @@ def extract_diff(container_id: str, diff_file_path: str, ignore_paths: List[str]
             # If a folder was changed, it means a file was change inside it
             # so we create the folder
             else:
-                os.makedirs(os.path.join(save_path, child.full_path[1:]))
+                os.makedirs(os.path.join(save_path, child.full_path[1:]), exist_ok=True)
             handle_node(child)
 
     handle_node(parent_node)
